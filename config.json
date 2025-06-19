@@ -1,0 +1,11 @@
+{
+    "dropbox_app_key": "あなたのkey",
+    "dropbox_app_secret": "あなたのsecret",
+    "dropbox_access_token": "sl.u.あなたのアクセストークン",
+    "dropbox_refresh_token": "あなたのレフレッシュトークン",
+    "dropbox_base_folder": "",
+    "line_channel_access_token": "あなたのトークン",
+    "monitor_folder": "検知フォルダ",
+    "excel_file_path": "参照/アドレス帳FAX.xlsx",
+    "token_obtained_at": 1750294566.3584027
+}
