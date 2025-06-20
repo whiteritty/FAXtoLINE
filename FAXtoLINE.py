@@ -13,6 +13,8 @@ from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 import msal
 import webbrowser
+import datetime
+import threading
 
 # --- 設定 ---
 SECRET_DIR = "secrets"
@@ -22,6 +24,7 @@ UNSENT_FILE = "未送信.txt"
 LOG_FILE = "fax_to_line.log"
 TIMEZONE_OFFSET = 9
 DELETE_THRESHOLD_DAYS = 7
+ONEDRIVE_FOLDER = "FAXtoLINE"  # フォルダ名を固定
 
 logging.basicConfig(filename=LOG_FILE, level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
@@ -54,6 +57,7 @@ def load_secret(key_path, secret_path):
     data = f.decrypt(encrypted).decode()
     return json.loads(data)
 
+
 class SecretInputGUIAll:
     def __init__(self, root, error_fields=None, error_messages=None):
         self.root = root
@@ -63,9 +67,7 @@ class SecretInputGUIAll:
         self.error_labels = {}
         self.fields = [
             {"label": "監視するフォルダのパス", "type": "folder", "key": "monitor_folder"},
-            {"label": "FAX番号と名前の対応表Excelファイルのパス（不要なら空欄）", "type": "file", "key": "excel_file_path", "optional": True},
             {"label": "OneDriveアプリのClient ID", "type": "text", "key": "onedrive_client_id"},
-            {"label": "OneDriveのアップロード先フォルダ名", "type": "text", "key": "onedrive_folder"},
             {"label": "LINEチャネルアクセストークン", "type": "text", "key": "line_token"},
         ]
         for i, field in enumerate(self.fields):
@@ -80,12 +82,13 @@ class SecretInputGUIAll:
             if field["type"] in ("folder", "file"):
                 browse_btn = tk.Button(root, text="参照", command=lambda k=field["key"]: self.browse(k))
                 browse_btn.grid(row=i, column=3, padx=2)
-            # エラーがある場合は表示
             if error_fields and field["key"] in error_fields:
                 msg = error_messages.get(field["key"], "")
                 self.error_labels[field["key"]].config(text=msg)
-        self.save_btn = tk.Button(root, text="保存", command=self.save)
-        self.save_btn.grid(row=len(self.fields), column=0, columnspan=4, pady=10)
+        self.run_btn = tk.Button(root, text="実行", command=self.save_and_run)
+        self.run_btn.grid(row=len(self.fields), column=0, pady=10)
+        self.exit_btn = tk.Button(root, text="終了", command=self.exit_app)
+        self.exit_btn.grid(row=len(self.fields), column=1, pady=10)
 
     def browse(self, key):
         field = next(f for f in self.fields if f["key"] == key)
@@ -97,7 +100,7 @@ class SecretInputGUIAll:
             self.entries[key].delete(0, tk.END)
             self.entries[key].insert(0, path)
 
-    def save(self):
+    def save_and_run(self):
         valid = True
         data = {}
         for field in self.fields:
@@ -107,12 +110,6 @@ class SecretInputGUIAll:
             if field["type"] == "folder":
                 if not os.path.isdir(value):
                     self.error_labels[key].config(text="フォルダが存在しません。")
-                    valid = False
-            elif field["type"] == "file":
-                if value == "" and field.get("optional"):
-                    value = None
-                elif value and not os.path.isfile(value):
-                    self.error_labels[key].config(text="ファイルが存在しません。")
                     valid = False
             else:
                 if not value:
@@ -124,28 +121,27 @@ class SecretInputGUIAll:
             if not os.path.exists(SECRET_KEY_FILE):
                 generate_key(SECRET_KEY_FILE)
             save_secret(data, SECRET_KEY_FILE, SECRET_DATA_FILE)
-            messagebox.showinfo("完了", "設定が保存されました。")
-            self.root.destroy()
+            self.root.destroy()  # ここでウィンドウを閉じて本体処理へ
+
+    def exit_app(self):
+        self.root.destroy()
+        exit(0)
+
 
 def get_secret_data():
     ensure_secret_dir()
-    # 設定ファイルがあれば値を読み込む
     data = {}
     if os.path.exists(SECRET_KEY_FILE) and os.path.exists(SECRET_DATA_FILE):
         data = load_secret(SECRET_KEY_FILE, SECRET_DATA_FILE)
-    # 入力フォームを常に表示し、値を編集可能にする
     root = tk.Tk()
     gui = SecretInputGUIAll(root)
-    # 既存値をセット
     for key, entry in gui.entries.items():
         if key in data and data[key]:
             entry.insert(0, data[key])
     root.mainloop()
-    # 保存後、再度読み込む
     return load_secret(SECRET_KEY_FILE, SECRET_DATA_FILE)
 
 def get_onedrive_token_delegated(client_id, scopes):
-    # 個人アカウント用エンドポイント
     authority = "https://login.microsoftonline.com/consumers"
     app = msal.PublicClientApplication(client_id, authority=authority)
     accounts = app.get_accounts()
@@ -173,16 +169,28 @@ def get_onedrive_token_delegated(client_id, scopes):
         print(f"デバイスコードフロー認証エラー: {result}")
         raise Exception("OneDrive認証失敗: " + str(result))
 
+def ensure_onedrive_folder_exists(access_token, folder_name):
+    url = f"https://graph.microsoft.com/v1.0/me/drive/root/children"
+    headers = {"Authorization": f"Bearer {access_token}"}
+    res = requests.get(url, headers=headers)
+    res.raise_for_status()
+    items = res.json().get("value", [])
+    for item in items:
+        if item.get("name") == folder_name and item.get("folder"):
+            return  # 既に存在
+    # なければ作成
+    create_url = f"https://graph.microsoft.com/v1.0/me/drive/root/children"
+    data = {"name": folder_name, "folder": {}, "@microsoft.graph.conflictBehavior": "rename"}
+    res = requests.post(create_url, headers={**headers, "Content-Type": "application/json"}, json=data)
+    res.raise_for_status()
+
 def upload_to_onedrive(access_token, local_path, onedrive_folder):
+    ensure_onedrive_folder_exists(access_token, onedrive_folder)
     file_name = os.path.basename(local_path)
     mime_type, _ = mimetypes.guess_type(local_path)
     if not mime_type:
         mime_type = "application/octet-stream"
-    folder = onedrive_folder.lstrip("/") if onedrive_folder else ""
-    if folder:
-        upload_url = f"https://graph.microsoft.com/v1.0/me/drive/root:/{folder}/{file_name}:/content"
-    else:
-        upload_url = f"https://graph.microsoft.com/v1.0/me/drive/root:/{file_name}:/content"
+    upload_url = f"https://graph.microsoft.com/v1.0/me/drive/root:/{onedrive_folder}/{file_name}:/content"
     headers = {
         "Authorization": f"Bearer {access_token}",
         "Content-Type": mime_type
@@ -191,17 +199,72 @@ def upload_to_onedrive(access_token, local_path, onedrive_folder):
         response = requests.put(upload_url, headers=headers, data=f)
     if response.status_code in (200, 201):
         file_info = response.json()
+        # 有効期限なしの匿名リンク
         share_url = f"https://graph.microsoft.com/v1.0/me/drive/items/{file_info['id']}/createLink"
-        share_body = {"type": "view", "scope": "anonymous"}
-        share_resp = requests.post(share_url, headers={"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"}, json=share_body)
+        share_body = {
+            "type": "view",
+            "scope": "anonymous"
+        }
+        share_resp = requests.post(
+            share_url,
+            headers={"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"},
+            json=share_body
+        )
         share_json = share_resp.json()
-        # ここを修正
         if "link" in share_json and "webUrl" in share_json["link"]:
             return share_json["link"]["webUrl"]
         else:
             raise Exception(f"共有リンク作成失敗: {share_resp.text}")
     else:
         raise Exception(f"OneDriveアップロード失敗: {response.text}")
+
+def delete_old_onedrive_files(access_token, folder_name, threshold_days=7):
+    url = f"https://graph.microsoft.com/v1.0/me/drive/root:/{folder_name}:/children"
+    headers = {"Authorization": f"Bearer {access_token}"}
+    now = datetime.datetime.now(datetime.timezone.utc)
+    deleted_count = 0  # 追加
+    while url:
+        res = requests.get(url, headers=headers)
+        res.raise_for_status()
+        data = res.json()
+        files = data.get("value", [])
+        for file in files:
+            created = file.get("createdDateTime")
+            if not created:
+                continue
+            created_dt = datetime.datetime.fromisoformat(created.replace("Z", "+00:00"))
+            days = (now - created_dt).days
+            parent_ref = file.get("parentReference", {})
+            parent_path = parent_ref.get("path", "")
+            if ONEDRIVE_FOLDER not in parent_path:
+                continue
+            if days >= threshold_days:
+                item_id = file["id"]
+                perms_url = f"https://graph.microsoft.com/v1.0/me/drive/items/{item_id}/permissions"
+                perms = requests.get(perms_url, headers=headers).json().get("value", [])
+                for perm in perms:
+                    if perm.get("link"):
+                        perm_id = perm["id"]
+                        del_url = f"https://graph.microsoft.com/v1.0/me/drive/items/{item_id}/permissions/{perm_id}"
+                        requests.delete(del_url, headers=headers)
+                del_file_url = f"https://graph.microsoft.com/v1.0/me/drive/items/{item_id}"
+                requests.delete(del_file_url, headers=headers)
+                print(f"【自動削除】{file['name']}（{days}日経過）を削除しました")
+                logging.info(f"【自動削除】{file['name']}（{days}日経過）を削除しました")
+                deleted_count += 1
+        url = data.get("@odata.nextLink")
+    if deleted_count == 0:
+        print("【自動削除】削除対象はありませんでした")
+        logging.info("【自動削除】削除対象はありませんでした")
+
+def periodic_delete_old_files():
+    while True:
+        try:
+            delete_old_onedrive_files(ONEDRIVE_ACCESS_TOKEN, ONEDRIVE_FOLDER, threshold_days=DELETE_THRESHOLD_DAYS)
+        except Exception as e:
+            print(f"自動削除エラー: {e}")
+            logging.error(f"自動削除エラー: {e}")
+        time.sleep(24 * 3600)  # 24時間ごとに実行
 
 def read_unsent_files():
     if not os.path.exists(UNSENT_FILE):
@@ -229,7 +292,6 @@ if __name__ == "__main__":
     MONITOR_FOLDER = secret["monitor_folder"]
     EXCEL_FILE_PATH = secret.get("excel_file_path")
     ONEDRIVE_CLIENT_ID = secret["onedrive_client_id"]
-    ONEDRIVE_FOLDER = secret["onedrive_folder"]
     LINE_CHANNEL_ACCESS_TOKEN = secret["line_token"]
     try:
         print("OneDrive認証中...")
@@ -242,6 +304,13 @@ if __name__ == "__main__":
         print(f"OneDrive認証エラー: {e}")
         logging.error(f"OneDrive認証エラー: {e}")
         exit(1)
+
+    # __main__ 直下からこの部分を削除
+    # try:
+    #     delete_old_onedrive_files(ONEDRIVE_ACCESS_TOKEN, ONEDRIVE_FOLDER, threshold_days=DELETE_THRESHOLD_DAYS)
+    # except Exception as e:
+    #     print(f"自動削除エラー: {e}")
+    #     logging.error(f"自動削除エラー: {e}")
 
     class PDFEventHandler(FileSystemEventHandler):
         def __init__(self):
@@ -346,5 +415,9 @@ if __name__ == "__main__":
             logging.info("監視停止")
             observer.stop()
         observer.join()
+
+    # 24時間ごとに削除チェック
+    delete_thread = threading.Thread(target=periodic_delete_old_files, daemon=True)
+    delete_thread.start()
 
     start_observer()
