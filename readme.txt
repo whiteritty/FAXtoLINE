@@ -1,6 +1,6 @@
 【FAXtoLINE概要】
 FAX受信→PDF化→OneDriveアップロード→LINE通知を自動化する個人向けツールです。
-PCが起動しPythonコードが実行している間しかLINE通知しません
+PCが起動しPythonコードが実行している間LINE通知します
 
 【重要】
 ※DropboxのAPI取得する必要はない
