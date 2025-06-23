@@ -26,6 +26,9 @@ TIMEZONE_OFFSET = 9
 DELETE_THRESHOLD_DAYS = 7
 ONEDRIVE_FOLDER = "FAXtoLINE"  # フォルダ名を固定
 
+# アドレス帳ファイルを実行ファイルと同じ場所で固定
+EXCEL_FILE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "アドレス帳FAX.xlsx")
+
 logging.basicConfig(filename=LOG_FILE, level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 def ensure_secret_dir():
@@ -150,7 +153,14 @@ def get_onedrive_token_delegated(client_id, scopes):
         result = app.acquire_token_silent(scopes, account=accounts[0])
         if result and "access_token" in result:
             print("既存アカウントでトークン取得成功")
-            return result["access_token"]
+            # expires_onがなければexpires_inから計算
+            expires_on = result.get("expires_on")
+            if not expires_on and "expires_in" in result:
+                expires_on = int(time.time()) + int(result["expires_in"])
+            return {
+                "access_token": result["access_token"],
+                "expires_on": expires_on
+            }
         else:
             print("既存アカウントでのトークン取得失敗、デバイスコードフローに進みます。")
     print("デバイスコードフローを初期化中...")
@@ -164,7 +174,13 @@ def get_onedrive_token_delegated(client_id, scopes):
     result = app.acquire_token_by_device_flow(flow)
     if "access_token" in result:
         print("デバイスコードフローでトークン取得成功")
-        return result["access_token"]
+        expires_on = result.get("expires_on")
+        if not expires_on and "expires_in" in result:
+            expires_on = int(time.time()) + int(result["expires_in"])
+        return {
+            "access_token": result["access_token"],
+            "expires_on": expires_on
+        }
     else:
         print(f"デバイスコードフロー認証エラー: {result}")
         raise Exception("OneDrive認証失敗: " + str(result))
@@ -219,10 +235,12 @@ def upload_to_onedrive(access_token, local_path, onedrive_folder):
         raise Exception(f"OneDriveアップロード失敗: {response.text}")
 
 def delete_old_onedrive_files(access_token, folder_name, threshold_days=7):
+    # フォルダがなければ作成（404対策）
+    ensure_onedrive_folder_exists(access_token, folder_name)
     url = f"https://graph.microsoft.com/v1.0/me/drive/root:/{folder_name}:/children"
     headers = {"Authorization": f"Bearer {access_token}"}
     now = datetime.datetime.now(datetime.timezone.utc)
-    deleted_count = 0  # 追加
+    deleted_count = 0
     while url:
         res = requests.get(url, headers=headers)
         res.raise_for_status()
@@ -257,10 +275,23 @@ def delete_old_onedrive_files(access_token, folder_name, threshold_days=7):
         print("【自動削除】削除対象はありませんでした")
         logging.info("【自動削除】削除対象はありませんでした")
 
+def is_token_expired(expires_on, margin=300):
+    # expires_onはUNIXタイムスタンプ
+    return time.time() > int(expires_on) - margin
+
 def periodic_delete_old_files():
+    global ONEDRIVE_TOKEN_INFO
     while True:
         try:
-            delete_old_onedrive_files(ONEDRIVE_ACCESS_TOKEN, ONEDRIVE_FOLDER, threshold_days=DELETE_THRESHOLD_DAYS)
+            # トークン期限切れなら再取得
+            if is_token_expired(ONEDRIVE_TOKEN_INFO["expires_on"]):
+                print("OneDriveトークン期限切れ、再取得します...")
+                ONEDRIVE_TOKEN_INFO.update(get_onedrive_token_delegated(
+                    ONEDRIVE_CLIENT_ID,
+                    scopes=["Files.ReadWrite.All"]
+                ))
+                print("OneDriveトークン再取得成功")
+            delete_old_onedrive_files(ONEDRIVE_TOKEN_INFO["access_token"], ONEDRIVE_FOLDER, threshold_days=DELETE_THRESHOLD_DAYS)
         except Exception as e:
             print(f"自動削除エラー: {e}")
             logging.error(f"自動削除エラー: {e}")
@@ -290,12 +321,12 @@ def process_unsent_files(handler):
 if __name__ == "__main__":
     secret = get_secret_data()
     MONITOR_FOLDER = secret["monitor_folder"]
-    EXCEL_FILE_PATH = secret.get("excel_file_path")
     ONEDRIVE_CLIENT_ID = secret["onedrive_client_id"]
     LINE_CHANNEL_ACCESS_TOKEN = secret["line_token"]
+    global ONEDRIVE_TOKEN_INFO
     try:
         print("OneDrive認証中...")
-        ONEDRIVE_ACCESS_TOKEN = get_onedrive_token_delegated(
+        ONEDRIVE_TOKEN_INFO = get_onedrive_token_delegated(
             ONEDRIVE_CLIENT_ID,
             scopes=["Files.ReadWrite.All"]
         )
@@ -304,13 +335,6 @@ if __name__ == "__main__":
         print(f"OneDrive認証エラー: {e}")
         logging.error(f"OneDrive認証エラー: {e}")
         exit(1)
-
-    # __main__ 直下からこの部分を削除
-    # try:
-    #     delete_old_onedrive_files(ONEDRIVE_ACCESS_TOKEN, ONEDRIVE_FOLDER, threshold_days=DELETE_THRESHOLD_DAYS)
-    # except Exception as e:
-    #     print(f"自動削除エラー: {e}")
-    #     logging.error(f"自動削除エラー: {e}")
 
     class PDFEventHandler(FileSystemEventHandler):
         def __init__(self):
@@ -331,7 +355,16 @@ if __name__ == "__main__":
             try:
                 print(f"OneDriveへアップロード中: {file_name}")
                 logging.info(f"OneDriveへアップロード中: {file_name}")
-                shared_link = upload_to_onedrive(ONEDRIVE_ACCESS_TOKEN, file_path, ONEDRIVE_FOLDER)
+                # トークン期限切れなら再取得
+                global ONEDRIVE_TOKEN_INFO
+                if is_token_expired(ONEDRIVE_TOKEN_INFO["expires_on"]):
+                    print("OneDriveトークン期限切れ、再取得します...")
+                    ONEDRIVE_TOKEN_INFO.update(get_onedrive_token_delegated(
+                        ONEDRIVE_CLIENT_ID,
+                        scopes=["Files.ReadWrite.All"]
+                    ))
+                    print("OneDriveトークン再取得成功")
+                shared_link = upload_to_onedrive(ONEDRIVE_TOKEN_INFO["access_token"], file_path, ONEDRIVE_FOLDER)
                 print(f"OneDriveアップロード成功: {shared_link}")
                 logging.info(f"OneDriveアップロード成功: {shared_link}")
                 name = self.extract_name(file_name) or file_name
@@ -342,19 +375,29 @@ if __name__ == "__main__":
                 write_unsent_file(file_path)
         def extract_name(self, file_name):
             try:
-                base_name = file_name[:-22]
-                normalized_name = re.sub(r'[\s-]', '', base_name)
-                logging.info(f"Normalized name: {normalized_name}")
-                if not normalized_name:
-                    return None
-                if not normalized_name[0].isdigit():
-                    return normalized_name
-                name = search_fax_destination(normalized_name)
-                logging.info(f"Sender name: {name}")
-                return name
+                # 右から22文字（日付＋拡張子）を除去
+                if len(file_name) > 22:
+                    base = file_name[:-22]
+                else:
+                    base = file_name.rsplit('.', 1)[0]
+                base = base.strip()
+                print(f"正規化前: {base}")
+        
+                # 先頭が数字かどうか判定
+                if base and base[0].isdigit():
+                    # ハイフン・スペースを除去
+                    normalized = re.sub(r'[\s\-]', '', base)
+                    print(f"正規化された名前: {normalized}")
+                    name = search_fax_destination(normalized)
+                    print(f"送信者名: {name}")
+                    return name if name else normalized
+                else:
+                    print(f"送信者名: {base}")
+                    return base
             except Exception as e:
                 print(f"名前抽出エラー: {e}")
                 logging.error(f"名前抽出エラー: {e}")
+                return None
                 return None
         def notify_line(self, name, shared_link=None):
             try:
@@ -381,18 +424,18 @@ if __name__ == "__main__":
                 logging.error(f"LINE通知エラー: {e}")
 
     def search_fax_destination(phone_number):
-        if not EXCEL_FILE_PATH:
-            return None
         try:
+            import unicodedata
             normalized_number = f"[{phone_number}]"
             df = pd.read_excel(EXCEL_FILE_PATH, engine='openpyxl')
             for _, row in df.iterrows():
-                if normalized_number == row.get('FAX'):
+                fax_raw = row.get('FAX')
+                if pd.isna(fax_raw):
+                    continue
+                fax_str = str(fax_raw).strip()
+                fax_str = unicodedata.normalize('NFKC', fax_str).replace(' ', '').replace('\u3000', '')
+                if normalized_number == fax_str:
                     return row.get('Name')
-            return None
-        except FileNotFoundError:
-            print(f"Excelファイルが見つかりません: {EXCEL_FILE_PATH}")
-            logging.warning(f"Excelファイルが見つかりません: {EXCEL_FILE_PATH}")
             return None
         except Exception as e:
             print(f"Excel処理エラー: {e}")
