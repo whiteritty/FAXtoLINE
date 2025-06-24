@@ -60,7 +60,6 @@ def load_secret(key_path, secret_path):
     data = f.decrypt(encrypted).decode()
     return json.loads(data)
 
-
 class SecretInputGUIAll:
     def __init__(self, root, error_fields=None, error_messages=None):
         self.root = root
@@ -130,7 +129,6 @@ class SecretInputGUIAll:
         self.root.destroy()
         exit(0)
 
-
 def get_secret_data():
     ensure_secret_dir()
     data = {}
@@ -144,16 +142,24 @@ def get_secret_data():
     root.mainloop()
     return load_secret(SECRET_KEY_FILE, SECRET_DATA_FILE)
 
+# --- MSALトークンキャッシュ対応 ---
+TOKEN_CACHE_FILE = "msal_token_cache.bin"
+
 def get_onedrive_token_delegated(client_id, scopes):
-    authority = "https://login.microsoftonline.com/consumers"
-    app = msal.PublicClientApplication(client_id, authority=authority)
+    import os
+    cache = msal.SerializableTokenCache()
+    if os.path.exists(TOKEN_CACHE_FILE):
+        with open(TOKEN_CACHE_FILE, "r") as f:
+            cache.deserialize(f.read())
+    app = msal.PublicClientApplication(client_id, authority="https://login.microsoftonline.com/consumers", token_cache=cache)
     accounts = app.get_accounts()
     if accounts:
         print("既存アカウントでトークン取得を試みます...")
         result = app.acquire_token_silent(scopes, account=accounts[0])
         if result and "access_token" in result:
             print("既存アカウントでトークン取得成功")
-            # expires_onがなければexpires_inから計算
+            with open(TOKEN_CACHE_FILE, "w") as f:
+                f.write(cache.serialize())
             expires_on = result.get("expires_on")
             if not expires_on and "expires_in" in result:
                 expires_on = int(time.time()) + int(result["expires_in"])
@@ -161,8 +167,6 @@ def get_onedrive_token_delegated(client_id, scopes):
                 "access_token": result["access_token"],
                 "expires_on": expires_on
             }
-        else:
-            print("既存アカウントでのトークン取得失敗、デバイスコードフローに進みます。")
     print("デバイスコードフローを初期化中...")
     flow = app.initiate_device_flow(scopes=scopes)
     if "user_code" not in flow:
@@ -174,6 +178,8 @@ def get_onedrive_token_delegated(client_id, scopes):
     result = app.acquire_token_by_device_flow(flow)
     if "access_token" in result:
         print("デバイスコードフローでトークン取得成功")
+        with open(TOKEN_CACHE_FILE, "w") as f:
+            f.write(cache.serialize())
         expires_on = result.get("expires_on")
         if not expires_on and "expires_in" in result:
             expires_on = int(time.time()) + int(result["expires_in"])
@@ -318,6 +324,37 @@ def process_unsent_files(handler):
         handler.upload_to_onedrive_and_notify(file_path, file_name)
     clear_unsent_file()
 
+def add_fax_history_to_excel(normalized_number):
+    try:
+        import openpyxl
+        from openpyxl.utils import get_column_letter
+
+        if not os.path.exists(EXCEL_FILE_PATH):
+            # 新規作成
+            wb = openpyxl.Workbook()
+            ws = wb.active
+            ws.title = "Sheet1"
+            ws["A1"] = "Name"
+            ws["B1"] = "FAX"
+        else:
+            wb = openpyxl.load_workbook(EXCEL_FILE_PATH)
+            ws = wb.active
+
+        # 既に同じ番号があれば追加しない
+        for row in ws.iter_rows(min_row=2, values_only=True):
+            if row and len(row) > 1 and str(row[1]).strip() == normalized_number:
+                return
+
+        next_row = ws.max_row + 1
+        ws[f"A{next_row}"] = "[アドレス帳履歴あり、登録名無し]"
+        ws[f"B{next_row}"] = normalized_number
+        wb.save(EXCEL_FILE_PATH)
+        print(f"アドレス帳に履歴追加: {normalized_number}")
+        logging.info(f"アドレス帳に履歴追加: {normalized_number}")
+    except Exception as e:
+        print(f"アドレス帳履歴追加エラー: {e}")
+        logging.error(f"アドレス帳履歴追加エラー: {e}")
+
 if __name__ == "__main__":
     secret = get_secret_data()
     MONITOR_FOLDER = secret["monitor_folder"]
@@ -382,7 +419,7 @@ if __name__ == "__main__":
                     base = file_name.rsplit('.', 1)[0]
                 base = base.strip()
                 print(f"正規化前: {base}")
-        
+
                 # 先頭が数字かどうか判定
                 if base and base[0].isdigit():
                     # ハイフン・スペースを除去
@@ -397,7 +434,6 @@ if __name__ == "__main__":
             except Exception as e:
                 print(f"名前抽出エラー: {e}")
                 logging.error(f"名前抽出エラー: {e}")
-                return None
                 return None
         def notify_line(self, name, shared_link=None):
             try:
@@ -436,6 +472,8 @@ if __name__ == "__main__":
                 fax_str = unicodedata.normalize('NFKC', fax_str).replace(' ', '').replace('\u3000', '')
                 if normalized_number == fax_str:
                     return row.get('Name')
+            # 見つからなければ履歴として追加
+            add_fax_history_to_excel(normalized_number)
             return None
         except Exception as e:
             print(f"Excel処理エラー: {e}")
